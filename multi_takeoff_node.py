@@ -1,381 +1,237 @@
-#!/usr/bin/env python3
 """
- * File: multi_takeoff_node.py
- * 多无人机自动起飞控制节点 - 修复高度、多机控制和等待时间问题
+ * File: multi_offb_node.py
+ * Fixed version for multiple UAV offboard control
 """
+
+#! /usr/bin/env python3
 
 import rospy
-import threading
-import time
-import sys
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeRequest
+from mavros_msgs.srv import CommandBool, SetMode
+import time
+import threading
 
-
-class UAVTakeoffControl:
-    def __init__(self, uav_id):
-        self.uav_id = uav_id
-        self.namespace = f"uav{uav_id}"
-        
-        # 初始化当前状态
+class UAVController:
+    def __init__(self, uav_namespace):
+        self.namespace = uav_namespace
         self.current_state = State()
         self.connected = False
         self.armed = False
-        self.mode = ""
+        self.offboard_enabled = False
         
-        # 初始化订阅者
-        self.state_sub = rospy.Subscriber(
-            f"/{self.namespace}/mavros/state", 
-            State, 
-            self.state_cb
-        )
+        # 使用完整的命名空间路径
+        state_topic = f"/{uav_namespace}/mavros/state"
+        setpoint_topic = f"/{uav_namespace}/mavros/setpoint_position/local"
+        arming_service = f"/{uav_namespace}/mavros/cmd/arming"
+        set_mode_service = f"/{uav_namespace}/mavros/set_mode"
         
-        # 等待服务并初始化客户端
-        try:
-            rospy.wait_for_service(f"/{self.namespace}/mavros/cmd/arming", timeout=5)
-            self.arming_client = rospy.ServiceProxy(
-                f"/{self.namespace}/mavros/cmd/arming", 
-                CommandBool
-            )
-        except rospy.ROSException:
-            self.arming_client = None
-            rospy.logwarn(f"UAV {self.uav_id}: Arming service not available")
+        self.state_sub = rospy.Subscriber(state_topic, State, self.state_cb)
+        self.local_pos_pub = rospy.Publisher(setpoint_topic, PoseStamped, queue_size=10)
+
+        # 等待服务可用
+        rospy.wait_for_service(arming_service)
+        rospy.wait_for_service(set_mode_service)
         
-        try:
-            rospy.wait_for_service(f"/{self.namespace}/mavros/set_mode", timeout=5)
-            self.set_mode_client = rospy.ServiceProxy(
-                f"/{self.namespace}/mavros/set_mode", 
-                SetMode
-            )
-        except rospy.ROSException:
-            self.set_mode_client = None
-            rospy.logwarn(f"UAV {self.uav_id}: Set mode service not available")
-        
-        # 控制标志
-        self.running = True
-        self.takeoff_complete = False
-        
-        rospy.loginfo(f"Initialized takeoff controller for UAV {uav_id}")
+        self.arming_client = rospy.ServiceProxy(arming_service, CommandBool)
+        self.set_mode_client = rospy.ServiceProxy(set_mode_service, SetMode)
+
+        self.rate = rospy.Rate(20)  # 20Hz
 
     def state_cb(self, msg):
-        """状态回调函数"""
         self.current_state = msg
         self.connected = msg.connected
         self.armed = msg.armed
-        self.mode = msg.mode
 
-    def wait_for_connection(self, timeout=15):
-        """等待飞控连接"""
-        rospy.loginfo(f"UAV {self.uav_id}: Waiting for connection...")
+    def create_pose(self, x, y, z):
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = rospy.Time.now()
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.position.z = z
+        # 保持水平姿态
+        pose.pose.orientation.w = 1.0
+        return pose
+
+    def initialize(self):
+        """等待连接并发送初始SetPoint"""
+        rospy.loginfo(f"{self.namespace}: Waiting for connection...")
+        while not rospy.is_shutdown() and not self.connected:
+            self.rate.sleep()
+        
+        rospy.loginfo(f"{self.namespace}: Connected! Sending initial setpoints...")
+        
+        # 发送初始位置（当前位置）
+        initial_pose = self.create_pose(0, 0, 0)
+        
+        # 持续发送SetPoint至少5秒
         start_time = time.time()
-        
-        while not rospy.is_shutdown() and time.time() - start_time < timeout:
-            if self.connected:
-                rospy.loginfo(f"UAV {self.uav_id}: Connected!")
-                return True
-            time.sleep(0.1)
-            
-        rospy.logerr(f"UAV {self.uav_id}: Connection timeout!")
-        return False
+        while time.time() - start_time < 5.0 and not rospy.is_shutdown():
+            initial_pose.header.stamp = rospy.Time.now()
+            self.local_pos_pub.publish(initial_pose)
+            self.rate.sleep()
 
-    def set_mode(self, mode, timeout=3):
-        """设置飞行模式"""
-        if self.set_mode_client is None:
-            return False
-            
+    def set_offboard_mode(self):
+        """尝试设置OFFBOARD模式"""
         try:
-            req = SetModeRequest()
-            req.custom_mode = mode
-            
-            response = self.set_mode_client(req)
-            
-            if not response.mode_sent:
-                return False
-            
-            # 等待模式切换确认
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if self.mode == mode:
-                    rospy.loginfo(f"UAV {self.uav_id}: Successfully switched to {mode} mode")
-                    return True
-                time.sleep(0.1)
-            
-            return False
-            
-        except Exception as e:
-            rospy.logwarn(f"UAV {self.uav_id}: Set mode {mode} exception: {e}")
-            return False
-
-    def arm(self, timeout=3):
-        """解锁无人机"""
-        if self.arming_client is None:
-            return False
-            
-        try:
-            if self.armed:
-                return True
-            
-            req = CommandBoolRequest()
-            req.value = True
-            
-            response = self.arming_client(req)
-            
-            if not response.success:
-                return False
-            
-            # 等待解锁完成
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if self.armed:
-                    rospy.loginfo(f"UAV {self.uav_id}: Successfully armed")
-                    return True
-                time.sleep(0.1)
-            
-            return False
-            
-        except Exception as e:
-            rospy.logwarn(f"UAV {self.uav_id}: Arming exception: {e}")
-            return False
-
-    def set_takeoff_altitude(self, altitude=5.0):
-        """设置起飞高度参数"""
-        try:
-            rospy.wait_for_service(f"/{self.namespace}/mavros/param/set", timeout=3)
-            from mavros_msgs.srv import ParamSet, ParamSetRequest
-            param_client = rospy.ServiceProxy(f"/{self.namespace}/mavros/param/set", ParamSet)
-            
-            req = ParamSetRequest()
-            req.param_id = "MIS_TAKEOFF_ALT"
-            req.value.real = altitude
-            
-            response = param_client(req)
-            if response.success:
-                rospy.loginfo(f"UAV {self.uav_id}: Set takeoff altitude to {altitude}m")
+            resp = self.set_mode_client(0, 'OFFBOARD')  # 0表示base_mode, 'OFFBOARD'表示custom_mode
+            if resp.mode_sent:
+                rospy.loginfo(f"{self.namespace}: OFFBOARD mode set successfully")
+                self.offboard_enabled = True
                 return True
             else:
-                rospy.logwarn(f"UAV {self.uav_id}: Failed to set takeoff altitude")
+                rospy.logwarn(f"{self.namespace}: Failed to set OFFBOARD mode")
                 return False
-        except:
-            rospy.logwarn(f"UAV {self.uav_id}: Could not set takeoff altitude parameter")
+        except rospy.ServiceException as e:
+            rospy.logerr(f"{self.namespace}: Set mode service call failed: {e}")
             return False
 
-    def takeoff_sequence(self, target_altitude=5.0):
-        """自动起飞序列"""
-        rospy.loginfo(f"UAV {self.uav_id}: Starting takeoff sequence to {target_altitude}m...")
-        
-        # 1. 等待连接
-        if not self.wait_for_connection(timeout=10):
+    def arm_vehicle(self):
+        """尝试解锁无人机"""
+        try:
+            resp = self.arming_client(True)
+            if resp.success:
+                rospy.loginfo(f"{self.namespace}: Vehicle armed successfully")
+                return True
+            else:
+                rospy.logwarn(f"{self.namespace}: Failed to arm vehicle")
+                return False
+        except rospy.ServiceException as e:
+            rospy.logerr(f"{self.namespace}: Arming service call failed: {e}")
             return False
+
+    def control_loop(self, target_x, target_y, target_z):
+        """主控制循环"""
+        target_pose = self.create_pose(target_x, target_y, target_z)
         
-        # 2. 设置起飞高度
-        self.set_takeoff_altitude(target_altitude)
-        time.sleep(1)
+        # 初始化
+        self.initialize()
         
-        # 3. 尝试在当前模式下解锁
-        rospy.loginfo(f"UAV {self.uav_id}: Current mode: {self.mode}")
+        last_request = rospy.Time.now()
+        setpoint_start_time = rospy.Time.now()
         
-        if not self.arm(timeout=3):
-            rospy.logwarn(f"UAV {self.uav_id}: Failed to arm in current mode {self.mode}")
+        rospy.loginfo(f"{self.namespace}: Starting control loop...")
+
+        while not rospy.is_shutdown():
+            current_time = rospy.Time.now()
             
-            # 尝试切换到可以解锁的模式
-            for mode in ["POSCTL", "ALTCTL", "MANUAL"]:
-                if self.set_mode(mode, timeout=2):
-                    time.sleep(0.5)
-                    if self.arm(timeout=3):
-                        break
+            # 持续发送SetPoint（这是关键！）
+            target_pose.header.stamp = current_time
+            self.local_pos_pub.publish(target_pose)
+            
+            # 确保SetPoint已经发送了一段时间（至少2秒）
+            if (current_time - setpoint_start_time).to_sec() > 2.0:
+                # 尝试设置OFFBOARD模式（每5秒尝试一次）
+                if not self.offboard_enabled and (current_time - last_request).to_sec() > 5.0:
+                    if self.set_offboard_mode():
+                        last_request = current_time
                     else:
-                        rospy.logwarn(f"UAV {self.uav_id}: Failed to arm in {mode} mode")
-        
-        if not self.armed:
-            rospy.logerr(f"UAV {self.uav_id}: Failed to arm in any mode")
-            return False
-        
-        # 4. 切换到AUTO.TAKEOFF模式
-        takeoff_success = False
-        for mode in ["AUTO.TAKEOFF", "TAKEOFF"]:
-            if self.set_mode(mode, timeout=3):
-                takeoff_success = True
-                break
-        
-        if not takeoff_success:
-            rospy.logerr(f"UAV {self.uav_id}: Failed to set takeoff mode")
-            return False
-        
-        # 5. 等待起飞完成
-        rospy.loginfo(f"UAV {self.uav_id}: Waiting for takeoff completion...")
-        takeoff_start_time = time.time()
-        
-        while not rospy.is_shutdown() and time.time() - takeoff_start_time < 25:
-            if self.mode not in ["AUTO.TAKEOFF", "TAKEOFF"]:
-                rospy.loginfo(f"UAV {self.uav_id}: Takeoff completed! Current mode: {self.mode}")
-                self.takeoff_complete = True
-                return True
+                        last_request = current_time
+                
+                # 如果OFFBOARD模式已设置但未解锁，尝试解锁
+                elif self.offboard_enabled and not self.armed and (current_time - last_request).to_sec() > 5.0:
+                    if self.arm_vehicle():
+                        last_request = current_time
+                    else:
+                        last_request = current_time
             
-            if not self.armed:
-                rospy.logerr(f"UAV {self.uav_id}: Disarmed during takeoff!")
-                return False
-            
-            time.sleep(0.5)
-        
-        rospy.logwarn(f"UAV {self.uav_id}: Takeoff timeout")
-        return False
+            self.rate.sleep()
 
-    def land_sequence(self):
-        """自动降落序列"""
-        rospy.loginfo(f"UAV {self.uav_id}: Starting land sequence...")
-        
-        for mode in ["AUTO.LAND", "LAND"]:
-            if self.set_mode(mode, timeout=3):
-                break
-        
-        # 等待降落完成
-        land_start_time = time.time()
-        
-        while not rospy.is_shutdown() and time.time() - land_start_time < 30:
-            if not self.armed:
-                rospy.loginfo(f"UAV {self.uav_id}: Land completed successfully!")
-                return True
-            time.sleep(0.5)
-        
-        # 强制解除武装
-        try:
-            if self.arming_client:
-                disarm_req = CommandBoolRequest()
-                disarm_req.value = False
-                self.arming_client(disarm_req)
-                rospy.loginfo(f"UAV {self.uav_id}: Forcibly disarmed")
-                return True
-        except:
-            pass
-        
-        return not self.armed
-
-    def run_takeoff_test(self):
-        """运行起飞测试"""
-        rospy.loginfo(f"UAV {self.uav_id}: Starting takeoff test...")
-        
-        if self.takeoff_sequence(target_altitude=5.0):
-            rospy.loginfo(f"UAV {self.uav_id}: Takeoff successful! Hovering for 5 seconds...")
-            
-            # 悬停5秒
-            hover_start = time.time()
-            while not rospy.is_shutdown() and time.time() - hover_start < 5:
-                if not self.armed:
-                    return False
-                time.sleep(0.5)
-            
-            if self.land_sequence():
-                rospy.loginfo(f"UAV {self.uav_id}: Mission completed successfully!")
-                return True
-            else:
-                rospy.logerr(f"UAV {self.uav_id}: Land failed!")
-                return False
-        else:
-            rospy.logerr(f"UAV {self.uav_id}: Takeoff failed!")
-            return False
-
-
-class MultiUAVTakeoffControl:
-    def __init__(self, num_uavs=1):
-        self.num_uavs = num_uavs
+class MultiUAVControl:
+    def __init__(self, uav_namespaces):
+        rospy.init_node("multi_offb_node_py", anonymous=True)
         self.uav_controllers = []
         
-        for i in range(num_uavs):
-            controller = UAVTakeoffControl(i)
+        for namespace in uav_namespaces:
+            controller = UAVController(namespace)
             self.uav_controllers.append(controller)
-        
-        rospy.loginfo(f"Initialized MultiUAVTakeoffControl with {num_uavs} UAV(s)")
-
-    def start_parallel_takeoff(self):
-        """并行启动起飞测试"""
-        if self.num_uavs == 0:
-            return False
-        
-        # 使用线程并行执行
+    
+    def run_formation(self, formation_positions):
+        """运行编队控制"""
         threads = []
-        results = [False] * self.num_uavs
         
-        for i, uav in enumerate(self.uav_controllers):
-            thread = threading.Thread(
-                target=lambda idx=i, u=uav: self._run_uav_test(idx, u, results),
-                name=f"uav_{i}_thread"
-            )
-            threads.append(thread)
+        # 为每个无人机创建控制线程
+        for i, controller in enumerate(self.uav_controllers):
+            if i < len(formation_positions):
+                x, y, z = formation_positions[i]
+                thread = threading.Thread(
+                    target=controller.control_loop, 
+                    args=(x, y, z),
+                    name=f"{controller.namespace}_thread"
+                )
+                thread.daemon = True
+                threads.append(thread)
         
         # 启动所有线程
         for thread in threads:
             thread.start()
+            rospy.loginfo(f"Started thread: {thread.name}")
         
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join(timeout=120)  # 2分钟超时
-        
-        success_count = sum(1 for r in results if r)
-        rospy.loginfo(f"Takeoff test results: {success_count}/{self.num_uavs} successful")
-        
-        return success_count > 0
-
-    def _run_uav_test(self, idx, uav, results):
-        """运行单个无人机测试"""
+        # 等待ROS关闭或线程结束
         try:
-            results[idx] = uav.run_takeoff_test()
-        except Exception as e:
-            rospy.logerr(f"UAV {idx}: Test failed with exception: {e}")
-            results[idx] = False
-
-
-def get_uav_count():
-    """获取无人机数量参数 - 从命令行参数或ROS参数获取"""
-    # 首先尝试从命令行参数获取
-    for arg in sys.argv:
-        if arg.startswith("num_uavs:="):
-            try:
-                num_uavs = int(arg.split(":=")[1])
-                num_uavs = max(1, min(num_uavs, 10))
-                rospy.loginfo(f"Using {num_uavs} UAVs from command line argument")
-                return num_uavs
-            except:
-                pass
-    
-    # 然后尝试从ROS参数获取
-    try:
-        if rospy.has_param("num_uavs"):
-            num_uavs = rospy.get_param("num_uavs", 1)
-            num_uavs = max(1, min(num_uavs, 10))
-            rospy.loginfo(f"Using {num_uavs} UAVs from ROS parameter")
-            return num_uavs
-    except:
-        pass
-    
-    # 最后使用默认值
-    rospy.loginfo("Using default: 1 UAV")
-    return 1
-
+            while not rospy.is_shutdown():
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            rospy.loginfo("Shutting down...")
+        
+        # 等待所有线程结束
+        for thread in threads:
+            thread.join(timeout=1.0)
 
 if __name__ == "__main__":
-    # 初始化ROS节点
-    rospy.init_node("multi_takeoff_control")
-    
-    # 获取无人机数量
-    num_uavs = get_uav_count()
-    
-    # 缩短等待时间
-    rospy.loginfo(f"Waiting for simulation to be ready (10 seconds) for {num_uavs} UAVs...")
-    time.sleep(10)
-    
-    # 创建多无人机控制器
-    controller = MultiUAVTakeoffControl(num_uavs)
-    
     try:
-        if controller.start_parallel_takeoff():
-            rospy.loginfo("All takeoff tests completed successfully!")
-        else:
-            rospy.logwarn("Some takeoff tests failed!")
-            
-    except KeyboardInterrupt:
-        rospy.loginfo("Takeoff test interrupted by user")
-    except Exception as e:
-        rospy.logerr(f"Takeoff test error: {e}")
+        import sys
+        import math
+
+        # 通过命令行参数传入无人机数量 (例如: rosrun test multi_takeoff_node.py 6)
+        num_uavs = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+
+        # 自动生成命名空间
+        uav_namespaces = [f"uav{i}" for i in range(num_uavs)]
+
+        multi_controller = MultiUAVControl(uav_namespaces)
+
+        # === 生成编队位置 ===
+        def generate_circle_positions(num_uavs, altitude=5):
+            """根据无人机数量生成圆形分布位置"""
+            positions = []
+            radius = int (num_uavs)
+            if num_uavs == 0:
+                return []
+            # uav0 在 (0, 0, z)
+            positions.append((0, 0, altitude))
+
+            if num_uavs > 1:
+                angle_step = 2 * math.pi / num_uavs
+                n = 0
+                i = 1
+                while i < num_uavs + 1:
+                    n += 1
+                    angle = n * angle_step
+                    x = radius * math.sin(angle)
+                    y = radius - radius * math.cos(angle) - 3 * i
+                    positions.append((x, y, altitude))
+                    i += 1
+                    if i < num_uavs + 1:
+                        x = radius * math.sin(angle) * -1
+                        y = radius - radius * math.cos(angle) - 3 * i
+                        positions.append((x, y, altitude))
+                        i += 1
+
+                
+
+            return positions
     
-    rospy.loginfo("Multi-UAV takeoff control node shutting down")
+
+        formation_positions = generate_circle_positions(num_uavs, altitude=5)
+
+        rospy.loginfo(f"Generated {num_uavs} UAV target positions:")
+        for i, p in enumerate(formation_positions):
+            rospy.loginfo(f"UAV{i}: {p}")
+
+        # multi_controller = MultiUAVControl(uav_namespaces)
+        multi_controller.run_formation(formation_positions)
+
+    except rospy.ROSInterruptException:
+        pass
