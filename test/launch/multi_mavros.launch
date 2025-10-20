@@ -1,0 +1,60 @@
+<launch>
+  <!-- Auto-generated -->
+
+      <group ns="uav0">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
+          <arg name="tgt_system" value="1" />
+        </include>
+      </group>
+        
+      <group ns="uav1">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14541@127.0.0.1:14581" />
+          <arg name="tgt_system" value="2" />
+        </include>
+      </group>
+        
+      <group ns="uav2">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14542@127.0.0.1:14582" />
+          <arg name="tgt_system" value="3" />
+        </include>
+      </group>
+        
+      <group ns="uav3">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14543@127.0.0.1:14583" />
+          <arg name="tgt_system" value="4" />
+        </include>
+      </group>
+        
+      <group ns="uav4">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14544@127.0.0.1:14584" />
+          <arg name="tgt_system" value="5" />
+        </include>
+      </group>
+        
+      <group ns="uav5">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14545@127.0.0.1:14585" />
+          <arg name="tgt_system" value="6" />
+        </include>
+      </group>
+        
+      <group ns="uav6">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14546@127.0.0.1:14586" />
+          <arg name="tgt_system" value="7" />
+        </include>
+      </group>
+        
+      <group ns="uav7">
+        <include file="$(find mavros)/launch/px4.launch">
+          <arg name="fcu_url" value="udp://:14547@127.0.0.1:14587" />
+          <arg name="tgt_system" value="8" />
+        </include>
+      </group>
+        
+</launch>
