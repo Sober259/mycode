@@ -140,7 +140,7 @@ class UAVController:
 
 class MultiUAVControl:
     def __init__(self, uav_namespaces):
-        rospy.init_node("multi_offb_node_py", anonymous=True)
+        rospy.init_node("multi_offb_node_py", anonymous=False)
         self.uav_controllers = []
         
         for namespace in uav_namespaces:
